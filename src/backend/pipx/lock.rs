@@ -48,6 +48,105 @@ impl PIPXBackend {
             )
     }
 
+    /// The lockfile revision a request's uv graph requirement comes from.
+    ///
+    /// A version resolved from the lockfile answers to its entry, graph or
+    /// not. An upgrade resolves outside the lockfile, so it only inherits the
+    /// requirement from a recorded graph: version-only entries (which an
+    /// upgrade of a graphless global tool writes) must stay version-only. A
+    /// bump rewrites the selector itself, which needs `bumped_lockfile_version`.
+    pub(crate) fn uv_lockfile_version(
+        &self,
+        config: &Config,
+        tv: &ToolVersion,
+    ) -> Result<Option<u32>> {
+        if tv.resolved_from_lockfile() {
+            return crate::lockfile::version_for_request(config, &tv.request);
+        }
+        match Self::graph_lockfile_version(config, &tv.request)? {
+            Some(revision) => Ok(Some(revision)),
+            None => self.bumped_lockfile_version(config, &tv.request),
+        }
+    }
+
+    /// The lockfile revision of the entry matching `request`, if that entry
+    /// records a dependency graph.
+    fn graph_lockfile_version(config: &Config, request: &ToolRequest) -> Result<Option<u32>> {
+        if !Settings::get().lockfile_enabled() {
+            return Ok(None);
+        }
+        match request.lockfile_resolve(config)? {
+            Some(entry) if entry.uv.is_some() => {
+                crate::lockfile::version_for_request(config, request)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The revision of the global request that `request` was bumped from.
+    ///
+    /// `upgrade --bump` replaces the selector (`0.16.7` -> `0.17.0`) before the
+    /// install, so no lockfile entry matches it. The owning global config still
+    /// holds the original request, and a request with the same owner, backend
+    /// and options is that original. Anything other than exactly one such
+    /// request stays version-only; graph creation for global tools is never
+    /// implicit.
+    fn bumped_lockfile_version(
+        &self,
+        config: &Config,
+        request: &ToolRequest,
+    ) -> Result<Option<u32>> {
+        if !Settings::get().lockfile_enabled() {
+            return Ok(None);
+        }
+        let Some(owner) = request.lockfile_source() else {
+            return Ok(None);
+        };
+        let Some(path) = owner
+            .path()
+            .filter(|path| crate::config::is_global_config(path))
+        else {
+            return Ok(None);
+        };
+        // Cheap exit before parsing the config: only a tool the lockfile
+        // already records can have had a graph.
+        if !request
+            .read_lockfile(config)?
+            .tools()
+            .contains_key(&request.ba().short)
+        {
+            return Ok(None);
+        }
+        let Some(cf) = config.config_files.get(path) else {
+            return Ok(None);
+        };
+        // Read the owner itself, not the effective requests: project or
+        // environment overrides can hide the original during `upgrade --global`.
+        let requests = cf.to_tool_request_set()?;
+        let target = PlatformTarget::from_current();
+        let options = self.resolve_lockfile_options(request, &target)?;
+        let full = request.ba().full();
+        let mut original = None;
+        for candidate in requests.tools.values().flatten() {
+            if !candidate.is_os_supported()
+                || candidate.source() != owner
+                || candidate.ba().short != request.ba().short
+                || candidate.ba().full() != full
+                || self.resolve_lockfile_options(candidate, &target)? != options
+            {
+                continue;
+            }
+            if original.is_some() {
+                return Ok(None);
+            }
+            original = Some(candidate);
+        }
+        match original {
+            Some(original) => Self::graph_lockfile_version(config, original),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn uv_lock_options_supported(&self, tv: &ToolVersion) -> bool {
         let raw = tv.request.options();
         let opts = PipxOptions::new(&raw);
